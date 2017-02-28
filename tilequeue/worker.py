@@ -97,6 +97,8 @@ class SqsQueueReader(object):
                 while not _non_blocking_put(self.output_queue, data):
                     if self.stop.is_set():
                         break
+            else:
+                time.sleep(5)
 
         self.sqs_queue.close()
         self.logger.debug('sqs queue reader stopped')
