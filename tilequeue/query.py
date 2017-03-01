@@ -3,6 +3,8 @@ from tilequeue.postgresql import DBAffinityConnectionsNoLimit
 from tilequeue.tile import calc_meters_per_pixel_dim
 from tilequeue.tile import coord_to_mercator_bounds
 from tilequeue.transform import calculate_padded_bounds
+import threading
+from pylru import lrucache
 import sys
 
 
@@ -83,26 +85,20 @@ def jinja_filter_bbox_overlaps(bounds, geometry_col_name, srid=3857):
     return bbox_filter
 
 
-def build_feature_queries(unpadded_bounds, layer_data, zoom):
+def base_feature_query(unpadded_bounds, layer_datum, zoom):
     meters_per_pixel_dim = calc_meters_per_pixel_dim(zoom)
-    queries_to_execute = []
-    for layer_datum in layer_data:
-        query_bounds_pad_fn = layer_datum['query_bounds_pad_fn']
-        padded_bounds = query_bounds_pad_fn(
-            unpadded_bounds, meters_per_pixel_dim)
-        query_generator = layer_datum['query_generator']
-        query = query_generator(padded_bounds, zoom)
-        queries_to_execute.append((layer_datum, query, padded_bounds))
-    return queries_to_execute
+    query_bounds_pad_fn = layer_datum['query_bounds_pad_fn']
+    padded_bounds = query_bounds_pad_fn(
+        unpadded_bounds, meters_per_pixel_dim)
+    query_generator = layer_datum['query_generator']
+    query = query_generator(padded_bounds, zoom)
+    return (query, padded_bounds)
 
-
-def execute_query(conn, query, layer_datum, padded_bounds):
+def execute_query(conn, query):
     try:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         cursor.execute(query)
-        rows = list(cursor.fetchall())
-
-        return rows, layer_datum, padded_bounds
+        return list(cursor.fetchall())
     except:
         # If any exception occurs during query execution, close the
         # connection to ensure it is not in an invalid state. The
@@ -121,32 +117,14 @@ def trim_layer_datum(layer_datum):
          if k not in ('query_generator', 'query_bounds_pad_fn')])
     return layer_datum_result
 
-
-def enqueue_queries(sql_conns, thread_pool, layer_data, zoom, unpadded_bounds):
-
-    queries_to_execute = build_feature_queries(
-        unpadded_bounds, layer_data, zoom)
-
-    empty_results = []
-    async_results = []
-    for (layer_datum, query, padded_bounds), sql_conn in zip(
-            queries_to_execute, sql_conns):
-        layer_datum = trim_layer_datum(layer_datum)
-        if query is None:
-            empty_feature_layer = dict(
-                name=layer_datum['name'],
-                features=[],
-                layer_datum=layer_datum,
-                padded_bounds=padded_bounds,
-            )
-            empty_results.append(empty_feature_layer)
-        else:
-            async_result = thread_pool.apply_async(
-                execute_query, (sql_conn, query, layer_datum, padded_bounds))
-            async_results.append(async_result)
-
-    return empty_results, async_results
-
+def read_row(row):
+    result = {}
+    for k, v in row.items():
+        if isinstance(v, buffer):
+            v = bytes(v)
+        if v is not None:
+            result[k] = v
+    return result
 
 class DataFetcher(object):
 
@@ -161,69 +139,76 @@ class DataFetcher(object):
             self.dbnames, self.conn_info)
         self.n_conn = n_conn
 
+        #TODO: make cache size configurable per-layer
+        self.caches = {
+            layer_datum['name']:(threading.Lock(), lrucache(10000))
+            for layer_datum in layer_data
+        }
+
+    def fetch_results_for_layer(self, conn, layer_datum, unpadded_bounds, zoom):
+        #in theory, this can return None for base query? to investigate.
+        #that's what enqueue_queries thinks.
+        #if so, we'd return an empty layer
+        base, padded_bounds = base_feature_query(unpadded_bounds, layer_datum, zoom)
+        id_query = "select __id__ from (%s) x" % base
+        ids = [int(r['__id__']) for r in execute_query(conn, id_query)]
+
+        layer_lock, layer_cache = self.caches[layer_datum['name']]
+        with layer_lock:
+            cached_keys = set(layer_cache.keys())
+            cached_items = { the_id:layer_cache[the_id] for the_id in cached_keys.intersection(set(ids)) }
+            ids_to_fetch = set(ids) - cached_keys
+
+        if len(ids_to_fetch) > 0:
+            fetch_query = "select * from (%s) x where __id__ in (%s)" % (base, ','.join(map(str,ids_to_fetch)))
+            results = execute_query(conn, fetch_query)
+            result_items = map(read_row, results)
+            db_items = {item['__id__']:item for item in result_items}
+        else:
+            db_items = {}
+
+        with layer_lock:
+            for item in db_items.values():
+                if item.get('__maycache__'):
+                    layer_cache[item['__id__']] = item
+
+        all_items = [(cached_items.get(i) or db_items.get(i)) for i in ids]
+
+        feature_layer = dict(
+            name=layer_datum['name'],
+            features=all_items,
+            layer_datum=trim_layer_datum(layer_datum),
+            padded_bounds=padded_bounds,
+        )
+
+        print "info: for %s, fetched %d features, %d from cache, %d from db" % (layer_datum['name'], len(ids), len(cached_keys), len(ids_to_fetch))
+        return feature_layer
+
     def __call__(self, coord, layer_data=None):
         if layer_data is None:
             layer_data = self.layer_data
         zoom = coord.zoom
         unpadded_bounds = coord_to_mercator_bounds(coord)
 
-        sql_conns = self.sql_conn_pool.get_conns(self.n_conn)
-        try:
-            # the padded bounds are used here in order to only have to
-            # issue a single set of queries to the database for all
-            # formats
-            empty_results, async_results = enqueue_queries(
-                sql_conns, self.io_pool, layer_data, zoom, unpadded_bounds)
-
-            feature_layers = []
-            async_exception = None
-            for async_result in async_results:
-                try:
-                    rows, layer_datum, padded_bounds = async_result.get()
-                except:
-                    exc_type, exc_value, exc_traceback = sys.exc_info()
-                    async_exception = exc_value
-                    # iterate through all async results to give others
-                    # a chance to close any connections that yielded
-                    # exceptions
-                    continue
-
-                # don't continue processing if an error occurred on
-                # any results
-                if async_exception is not None:
-                    continue
-
-                # read the bytes out of each row, otherwise the pickle
-                # will fail because the geometry is a read buffer
-                # only keep values that are not None
-                read_rows = []
-                for row in rows:
-                    read_row = {}
-                    for k, v in row.items():
-                        if isinstance(v, buffer):
-                            v = bytes(v)
-                        if v is not None:
-                            read_row[k] = v
-                    read_rows.append(read_row)
-
-                feature_layer = dict(
-                    name=layer_datum['name'], features=read_rows,
-                    layer_datum=layer_datum,
-                    padded_bounds=padded_bounds,
+        #note: this isn't really a pool...
+        def fetch_layer(layer_datum):
+            sql_conn = self.sql_conn_pool.get_conns(1)[0]
+            try:
+                return self.fetch_results_for_layer(
+                    sql_conn,
+                    layer_datum,
+                    unpadded_bounds,
+                    zoom
                 )
-                feature_layers.append(feature_layer)
+            finally:
+                self.sql_conn_pool.put_conns([sql_conn])
 
-            # bail if an error occurred
-            if async_exception is not None:
-                raise async_exception
+        feature_layers = self.io_pool.map( fetch_layer, layer_data )
 
-            feature_layers.extend(empty_results)
-
-            return dict(
-                feature_layers=feature_layers,
-                unpadded_bounds=unpadded_bounds,
-                padded_bounds=padded_bounds,
-            )
-
-        finally:
-            self.sql_conn_pool.put_conns(sql_conns)
+        #the previous version assumes there will be at least one layer, and padded bounds are effectively the same for all, apparently
+        padded_bounds = feature_layers[0]['padded_bounds']
+        return dict(
+            feature_layers=feature_layers,
+            unpadded_bounds=unpadded_bounds,
+            padded_bounds=padded_bounds,
+        )
