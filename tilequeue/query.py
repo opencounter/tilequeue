@@ -4,8 +4,11 @@ from tilequeue.tile import calc_meters_per_pixel_dim
 from tilequeue.tile import coord_to_mercator_bounds
 from tilequeue.transform import calculate_padded_bounds
 import threading
+#from lru import LRUCacheDict
 from pylru import lrucache
 import sys
+from shapely import wkb
+from shapely.geometry import box as Box
 
 
 def generate_query(start_zoom, template, bounds, zoom):
@@ -141,23 +144,24 @@ class DataFetcher(object):
 
         #TODO: make cache size configurable per-layer
         self.caches = {
+            #layer_datum['name']:(threading.Lock(), LRUCacheDict(max_size=10000, expiration=5*60 ))
             layer_datum['name']:(threading.Lock(), lrucache(10000))
             for layer_datum in layer_data
         }
 
-    def fetch_results_for_layer(self, conn, layer_datum, unpadded_bounds, zoom):
+    def fetch_results_for_layer(self, conn, layer_datum, unpadded_bounds, coord):
         #in theory, this can return None for base query? to investigate.
         #that's what enqueue_queries thinks.
         #if so, we'd return an empty layer
-        base, padded_bounds = base_feature_query(unpadded_bounds, layer_datum, zoom)
+        base, padded_bounds = base_feature_query(unpadded_bounds, layer_datum, coord.zoom)
         id_query = "select __id__ from (%s) x" % base
         ids = [int(r['__id__']) for r in execute_query(conn, id_query)]
 
         layer_lock, layer_cache = self.caches[layer_datum['name']]
         with layer_lock:
-            cached_keys = set(layer_cache.keys())
-            cached_items = { the_id:layer_cache[the_id] for the_id in cached_keys.intersection(set(ids)) }
-            ids_to_fetch = set(ids) - cached_keys
+            cached_items = { k:layer_cache[k]['item'].copy() for k in ids if k in layer_cache }
+            ids_to_fetch = set(ids) - set(cached_items.keys())
+
 
         if len(ids_to_fetch) > 0:
             fetch_query = "select * from (%s) x where __id__ in (%s)" % (base, ','.join(map(str,ids_to_fetch)))
@@ -167,12 +171,36 @@ class DataFetcher(object):
         else:
             db_items = {}
 
-        with layer_lock:
-            for item in db_items.values():
-                if item.get('__maycache__'):
-                    layer_cache[item['__id__']] = item
-
         all_items = [(cached_items.get(i) or db_items.get(i)) for i in ids]
+
+        #update cache and set clipped geometry
+        #this is hacky, datafetcher isn't supposed to know about geometry
+        #also, without a per-layer config, we don't know if we really want to return clipped geometry or not
+        #it's also dangerous, putting a (potentially) CPU-heavy task blocking the io_thread
+        bbox = Box(*padded_bounds['polygon'])
+        parent_coords = [
+            (coord.column/2**z, coord.row/2**z, coord.zoom-z) for z in xrange(0,coord.zoom+1)
+        ] + ["full"]
+        contained = 0
+        clipped = 0
+        empty = 0
+        with layer_lock:
+            for item in all_items:
+                if not item.get('__maycache__'):
+                    continue
+                key = item['__id__']
+                if not key in layer_cache:
+                    layer_cache[key] = { 'item': item.copy(), 'clips': {'full': wkb.loads(item['__geometry__']) } }
+                cached_clips = layer_cache[key]["clips"]
+                closest_parent = next(cached_clips[c] for c in parent_coords if c in cached_clips)
+                if bbox.contains(closest_parent) or closest_parent.is_empty:
+                    contained += 1
+                    item['__geometry__'] = closest_parent.wkb
+                elif bbox.intersects(closest_parent):
+                    clipped += 1
+                    clipped_geom = closest_parent.intersection(bbox)
+                    cached_clips[(coord.column, coord.row, coord.zoom)] = clipped_geom
+                    item['__geometry__'] = clipped_geom.wkb
 
         feature_layer = dict(
             name=layer_datum['name'],
@@ -180,14 +208,13 @@ class DataFetcher(object):
             layer_datum=trim_layer_datum(layer_datum),
             padded_bounds=padded_bounds,
         )
+        print "for %r, %d contained %d clipped %d non-intersect" % (coord, contained, clipped, len(ids) - contained - clipped)
 
-        print "info: for %s, fetched %d features, %d from cache, %d from db" % (layer_datum['name'], len(ids), len(cached_keys), len(ids_to_fetch))
         return feature_layer
 
     def __call__(self, coord, layer_data=None):
         if layer_data is None:
             layer_data = self.layer_data
-        zoom = coord.zoom
         unpadded_bounds = coord_to_mercator_bounds(coord)
 
         #note: this isn't really a pool...
@@ -198,12 +225,13 @@ class DataFetcher(object):
                     sql_conn,
                     layer_datum,
                     unpadded_bounds,
-                    zoom
+                    coord
                 )
             finally:
                 self.sql_conn_pool.put_conns([sql_conn])
 
-        feature_layers = self.io_pool.map( fetch_layer, layer_data )
+        #feature_layers = self.io_pool.map( fetch_layer, layer_data )
+        feature_layers = map( fetch_layer, layer_data )
 
         #the previous version assumes there will be at least one layer, and padded bounds are effectively the same for all, apparently
         padded_bounds = feature_layers[0]['padded_bounds']
